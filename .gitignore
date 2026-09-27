@@ -2,6 +2,7 @@
 apidpsk.txt
 ya.txt
 exch.txt
+w.txt
 api_key.txt
 *.key
 .env
@@ -47,6 +48,13 @@ run_*.txt
 *.log
 
 gigakey.txt
+
+# --- Результат «Цепочки» Конвертера (MCP): доп. инструмент save_result ---
+test_1.txt
+
+# --- Результат «Хранителя» погоды (MCP «Погода»): таблица по странам ---
+weathe.txt
+
 
 _run_o.txt
 _run_e.txt

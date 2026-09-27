@@ -22,6 +22,7 @@ caldav
 # Без них импорт падает: No module named 'caldav'.
 icalendar
 #
-# MCP-сервер «Конвертер» (currency_server.py) дополнительных зависимостей НЕ
-# требует: работа с ExchangeRate-API идёт через стандартный urllib, а задания
-# расписания хранятся в JSON (rtk_app/jobs_store.py).
+# MCP-сервер «Время» (currency_server.py) дополнительных зависимостей НЕ
+# требует: значение берётся из локального времени (datetime), внешних вызовов
+# нет. Того же требуют MCP-серверы «Погода» (weather_server.py, OpenWeatherMap)
+# и «Замполит» (zampolit_server.py): только стандартный urllib.
