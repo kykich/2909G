@@ -52,10 +52,21 @@ JSON-API:
                               (настройки + последний статус сервера)
     POST /api/mcp           - {action, …} -> настройки и статус MCP:
                               "state"  — вернуть текущее состояние (по умолч.);
-                              "set"    — сохранить {enabled?, model?};
+                              "set"    — сохранить {enabled?, model?, server?};
                               "status" — ПРОВЕРИТЬ статус MCP-сервера
                                          (подключиться, получить список
-                                         инструментов и вернуть результат).
+                                         инструментов и вернуть результат);
+                              "compose"— ЗАПУСТИТЬ КОМПОЗИЦИЮ MCP-серверов
+                                         (пайплайн календарь → замполит →
+                                         завхоз; см. docs/task5.md) и вернуть
+                                         отчёт о прогоне. Композиция
+                                         ВЗАИМОИСКЛЮЧАЮЩА с чекбоксом
+                                         «Использовать MCP»: её запуск
+                                         выключает чекбокс, а включение
+                                         чекбокса — останавливает композицию
+                                         (см. ниже);
+                              "compose_stop" — остановить режим композиции
+                                         (возврат к отдельным серверам).
     """
 import json
 import mimetypes
@@ -91,6 +102,17 @@ class _ServerState:
     mcp_server = getattr(config, "MCP_SERVER_DEFAULT", "calendar")
     mcp_status = None
     mcp_lock = threading.Lock()
+    # КОМПОЗИЦИЯ MCP: запущена ли она сейчас.
+    # ВАЖНО: композиция и режим «Использовать MCP» — ВЗАИМОИСКЛЮЧАЮЩИЕ.
+    #   * запуск композиции — выключает чекбокс «Использовать MCP»
+    #     (композиция работает сама по себе);
+    #   * включение чекбокса «Использовать MCP» — останавливает композицию
+    #     и переводит сервер в режим отдельных серверов по выбору.
+    composition_running = False
+    # Поток фонового ТИКА композиции (запускается только в режиме композиции).
+    composition_thread = None
+    # Событие остановки тика композиции (устанавливается при выключении).
+    composition_stop = None
 
 
 def _mcp_settings_file():
@@ -115,6 +137,10 @@ def _load_mcp_settings():
             server = data.get("server")
             if isinstance(server, str) and server:
                 _ServerState.mcp_server = server
+            # Режим композиции (взаимоисключающий с MCP).
+            comp = data.get("composition")
+            if comp is not None:
+                _ServerState.composition_running = bool(comp)
     except Exception as exc:
         print("[MCP] не удалось загрузить настройки: %s" % exc, flush=True)
 
@@ -129,7 +155,8 @@ def _save_mcp_settings():
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"enabled": _ServerState.mcp_enabled,
                        "model": _ServerState.mcp_model,
-                       "server": _ServerState.mcp_server}, f,
+                       "server": _ServerState.mcp_server,
+                       "composition": _ServerState.composition_running}, f,
                       ensure_ascii=False, indent=2)
     except Exception as exc:
         print("[MCP] не удалось сохранить настройки: %s" % exc, flush=True)
@@ -157,6 +184,10 @@ def _mcp_state_payload(check=False):
         "servers": servers,
         "available": mcp_client is not None,
         "status": status,
+        # Режим композиции (взаимоисключающий с «Использовать MCP»).
+        # ВАЖНО: ключ называется composition_running, чтобы НЕ конфликтовать
+        # с ключом "composition" (ОТЧЁТ прогона) в ответе на action="compose".
+        "composition_running": bool(_ServerState.composition_running),
     }
 
 
@@ -210,10 +241,271 @@ def _collect_due_reminders():
     return lines
 
 
+def _mcp_text(server_id, tool, arguments=None, timeout=None):
+    """Вызывает MCP-инструмент и возвращает текст результата.
+
+    Возвращает (ok, text): ok=False, если клиент недоступен или инструмент
+    сообщил об ошибке. Обёртка над mcp_client.mcp_call_tool с явным сроком.
+    """
+    if mcp_client is None:
+        return False, "MCP-клиент недоступен (не установлен пакет mcp)."
+    try:
+        res = mcp_client.mcp_call_tool(tool, arguments or {},
+                                       timeout=timeout, server_id=server_id)
+    except Exception as exc:
+        return False, "Ошибка вызова %s: %s" % (tool, exc)
+    if not res.get("ok"):
+        return False, res.get("error") or res.get("text") or "ошибка инструмента"
+    return True, (res.get("text") or "")
+
+
+def _composition_run(verbose=False):
+    """ЗАПУСКАЕТ КОМПОЗИЦИЮ MCP-серверов (см. docs/task5.md).
+
+    Пайплайн:
+      1) «календарь» — события за COMPOSITION_DAYS_AHEAD дней (вперёд от сегодня);
+      2) «замполит»  — по каждому событию определяется ФОРМАТ вывода времени
+                       по времени начала (минуты/часы/без изменения) и время
+                       начала приводится к нему (build_pairs);
+      3) «завхоз»    — сохранение пар «событие + время» в JSON-файл (save_pairs).
+
+    «Доска» в композиции не участвует (это сервер ВЫВОДА по запросу в чате),
+    но результат «завхоза» ей потом доступен для таблицы.
+
+    Возвращает dict с отчётом: {ok, calendar, pairs, saved, error, steps}.
+    События календаря передаются «замполиту» строкой JSON (серверы остаются
+    раздельными stdio-процессами; композицию собирает оркестратор).
+    """
+    timeout = getattr(config, "COMPOSITION_CALL_TIMEOUT", 30)
+    days = int(getattr(config, "COMPOSITION_DAYS_AHEAD", 7) or 7)
+    cal_srv = getattr(config, "COMPOSITION_CALENDAR_SERVER", "calendar")
+    zam_srv = getattr(config, "COMPOSITION_ZAMPOLIT_SERVER", "zampolit")
+    zav_srv = getattr(config, "COMPOSITION_ZAVHOZ_SERVER", "zavhoz")
+    steps = []
+    # Состав композиции для СООБЩЕНИЯ в чат (названия серверов + описания).
+    servers = list(getattr(config, "COMPOSITION_SERVERS", []) or [])
+
+    # --- Шаг 1: события календаря на ближайшие N дней ---
+    today = time.strftime("%Y-%m-%d")
+    until = time.strftime("%Y-%m-%d", time.localtime(time.time() + days * 86400))
+    ok, cal_text = _mcp_text(cal_srv, "list_events",
+                             {"start": today, "end": until}, timeout=timeout)
+    steps.append({"step": "calendar", "ok": ok, "detail": cal_text[:400]})
+    if not ok:
+        return {"ok": False, "error": "Календарь: %s" % cal_text,
+                "steps": steps, "pairs": [], "count": 0, "servers": servers}
+    events = _parse_calendar_events(cal_text)
+    steps.append({"step": "calendar_parsed", "ok": True,
+                  "detail": "событий: %d" % len(events)})
+    if not events:
+        # Нет событий — композиция формально успешна, но сохранять нечего.
+        ok, sav_text = _mcp_text(zav_srv, "save_pairs",
+                                 {"pairs_json": json.dumps({"pairs": []}),
+                                  "source": "composition"}, timeout=timeout)
+        steps.append({"step": "zavhoz", "ok": ok, "detail": sav_text[:400]})
+        return {"ok": True, "calendar": cal_text, "pairs": [], "count": 0,
+                "saved": sav_text, "steps": steps, "servers": servers,
+                "detail": "Событий на ближайшие %d дней нет." % days}
+
+    # --- Шаг 2: замполит — пары «событие + время» ---
+    ok, zam_text = _mcp_text(zam_srv, "build_pairs",
+                             {"events_json": json.dumps(events, ensure_ascii=False)},
+                             timeout=timeout)
+    steps.append({"step": "zampolit", "ok": ok, "detail": zam_text[:600]})
+    if not ok:
+        return {"ok": False, "error": "Замполит: %s" % zam_text,
+                "steps": steps, "pairs": [], "count": 0, "servers": servers}
+    try:
+        built = json.loads(zam_text)
+    except Exception as exc:
+        return {"ok": False, "error": "Замполит вернул не JSON: %s" % exc,
+                "steps": steps, "pairs": [], "count": 0, "servers": servers}
+    pairs = built.get("pairs") if isinstance(built, dict) else None
+    if not isinstance(pairs, list):
+        pairs = []
+
+    # --- Шаг 3: завхоз — сохранить снимок в JSON ---
+    ok, sav_text = _mcp_text(zav_srv, "save_pairs",
+                             {"pairs_json": json.dumps({"pairs": pairs},
+                                                       ensure_ascii=False),
+                              "source": "composition"}, timeout=timeout)
+    steps.append({"step": "zavhoz", "ok": ok, "detail": sav_text[:400]})
+    if not ok:
+        return {"ok": False, "error": "Завхоз: %s" % sav_text,
+                "steps": steps, "pairs": pairs, "count": len(pairs),
+                "servers": servers}
+    if verbose:
+        print("[COMPOSE] пар: %d; %s" % (len(pairs), sav_text), flush=True)
+    return {"ok": True, "calendar": cal_text, "pairs": pairs,
+            "count": len(pairs), "saved": sav_text, "steps": steps,
+            "servers": servers,
+            "detail": "Событий: %d, пар сохранено: %d." % (len(events), len(pairs))}
+
+
+def _format_composition_message(report):
+    """Формирует ОТДЕЛЬНОЕ сообщение в чат после запуска композиции.
+
+    Содержит: заголовок «Композиция MCP запущена», список задействованных
+    MCP-серверов с кратким описанием работы каждого, и краткий итог прогона.
+    Возвращает готовый к показу текст (или "" если серверов нет).
+    """
+    report = report or {}
+    servers = report.get("servers") or list(
+        getattr(config, "COMPOSITION_SERVERS", []) or [])
+    lines = ["**Композиция MCP запущена.** Задействованы серверы:"]
+    for s in servers:
+        label = s.get("label") or s.get("id") or "?"
+        desc = s.get("desc") or ""
+        lines.append("- **%s** — %s" % (label, desc))
+    # Итог прогона (сколько событий/пар) — если есть.
+    if report.get("ok"):
+        detail = report.get("detail") or ""
+        if detail:
+            lines.append("")
+            lines.append("Итог: %s" % detail)
+    else:
+        lines.append("")
+        lines.append("Внимание, ошибка прогона: %s"
+                     % (report.get("error") or "неизвестно"))
+    return "\n".join(lines)
+
+
+def _composition_report_text(report):
+    """Готовит ТЕКСТОВУЮ сводку прогона композиции ДЛЯ МОДЕЛИ.
+
+    Модель, выбранная в селекте «Модель MCP», получает эту сводку и
+    формирует короткое сообщение в чат (_handle_mcp, action «compose»).
+    Возвращает строку: состав серверов, итог и (если есть) сохранённые пары.
+    """
+    report = report or {}
+    lines = []
+    servers = report.get("servers") or list(
+        getattr(config, "COMPOSITION_SERVERS", []) or [])
+    if servers:
+        lines.append("Задействованные MCP-серверы:")
+        for s in servers:
+            label = s.get("label") or s.get("id") or "?"
+            desc = s.get("desc") or ""
+            lines.append("  - %s — %s" % (label, desc))
+    if report.get("ok"):
+        lines.append("Результат: %s" % (report.get("detail") or "успешно"))
+        if report.get("saved"):
+            lines.append("Сохранено: %s" % report.get("saved"))
+        pairs = report.get("pairs") or []
+        if pairs:
+            lines.append("Пары «событие + время» (до %d):" % len(pairs))
+            for p in pairs[:10]:
+                ev = p.get("event") or p.get("summary") or "?"
+                tm = p.get("time") or ""
+                mode = p.get("mode") or ""
+                lines.append("  - %s → %s (%s)" % (ev, tm, mode))
+    else:
+        lines.append("Результат: ОШИБКА — %s" % (report.get("error") or "?"))
+    return "\n".join(lines)
+
+
+def _parse_calendar_events(text):
+    """Разбирает текстовый вывод list_events в список {summary, start}.
+
+    Календарь печатает блоки вида:
+        События за <период>:
+          UID: <uid>
+          <YYYY-MM-DD HH:MM> — <summary>, до …, место: …   (с временем)
+          <YYYY-MM-DD>       — <summary>, до …, место: …   (на весь день)
+
+    Событие «НА ВЕСЬ ДЕНЬ» календарь отдаёт БЕЗ времени — только датой
+    (``_localize_str`` для date-значения печатает ``"%Y-%m-%d"``). Такие
+    строки распознаём отдельно и помечаем ``all_day: True`` (поле ``start`` —
+    дата, поля ``time`` нет). Для событий со временем ``all_day: False``.
+
+    Берём строку времени и название до запятой/«, до». Терпимо к формату:
+    если разобрать не удалось — событие пропускается.
+    """
+    import re
+    events = []
+    # Строка события со ВРЕМЕНЕМ: "  2026-09-26 10:00 — Перекур, до ...".
+    pat_timed = re.compile(
+        r"(?P<start>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})\s*—\s*(?P<summary>.+)")
+    # Строка события БЕЗ времени (на весь день): "  2026-09-30 — Отпуск, ...".
+    pat_allday = re.compile(
+        r"(?P<start>\d{4}-\d{2}-\d{2})\s*—\s*(?P<summary>.+)")
+    # Отсекаем служебные строки (заголовок «События за …», «UID: …»), иначе
+    # заголовок-диапазон «… 2026-09-26 — 2026-10-03:» ложно ловится как
+    # событие «на весь день».
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("UID:"):
+            continue
+        if re.match(r"^\s*События за\b", line) or re.match(
+                r"^\s*\d{4}-\d{2}-\d{2}\s+—\s+\d{4}-\d{2}-\d{2}\s*:", line):
+            continue
+        m = pat_timed.search(line)
+        all_day = False
+        if m:
+            start = m.group("start").replace("T", " ")
+        else:
+            m = pat_allday.search(line)
+            if not m:
+                continue
+            start = m.group("start").strip()
+            all_day = True
+        summary = m.group("summary").strip()
+        # Обрезаем хвост «, до …» / «, место …» — оставляем только название.
+        for sep in (", до ", ", место:", ", место "):
+            idx = summary.find(sep)
+            if idx != -1:
+                summary = summary[:idx].strip()
+        # Название в кавычках-ёлочках убираем, если есть.
+        summary = summary.strip().strip("«»\"'")
+        events.append({"summary": summary, "start": start, "all_day": all_day})
+    return events
+
+
+def _board_direct_result(server_id, model=None):
+    """Надёжно формирует ответ для сервера «Доска» БЕЗ выбора инструмента LLM.
+
+    Проблема: при запросе к «Доске» через обычный MCP-путь инструмент выбирает
+    МОДЕЛЬ — она может выбрать не тот инструмент (ping) или ошибиться, и вывод
+    доски «падает». Здесь инструменты доски вызываются ДЕТЕРМИНИРОВАННО:
+
+      1) ``show_board_html`` — HTML-таблица (основной вывод в чате);
+      2) ``show_board``      — текстовая таблица (текстовый ответ/фолбэк).
+
+    Возвращает готовый ``result``-dict той же формы, что и ``answer_via_mcp``:
+    {ok, text, html, answers, meta, ...}. Никакой LLM для выбора инструмента
+    не привлекается — это гарантирует, что доска всегда выводится таблицей.
+    """
+    ok_html, html_text = _mcp_text(server_id, "show_board_html", {})
+    ok_txt, board_text = _mcp_text(server_id, "show_board", {})
+    # Если ни один инструмент не ответил — вернём понятную ошибку.
+    if not ok_html and not ok_txt:
+        err = board_text or html_text or "инструмент доски недоступен"
+        return {"ok": False, "error": "Доска: %s" % err, "text": "",
+                "html": "", "answers": [], "meta": ""}
+    # Текст для ответа — таблица show_board; если она не удалась, берём HTML.
+    text = board_text if ok_txt else html_text
+    html = ""
+    if ok_html and "<table" in str(html_text):
+        html = ('<div class="mcp-answer"><div class="mcp-answer-head">'
+                'MCP-инструмент: <b>show_board_html</b>({})</div>'
+                '<div class="mcp-answer-body">%s</div></div>'
+                % html_text)
+    else:
+        # Фолбэк: оборачиваем текст в pre, как это делает агент.
+        import html as _html
+        html = ('<div class="mcp-answer"><div class="mcp-answer-head">'
+                'MCP-инструмент: <b>show_board</b>({})</div>'
+                '<div class="mcp-answer-body"><pre>%s</pre></div></div>'
+                % _html.escape(str(board_text)))
+    label = model or "MCP"
+    return {"ok": True, "text": text, "html": html,
+            "answers": [{"label": label, "model": label, "text": text}],
+            "meta": "MCP: show_board"}
+
+
 def _set_agent(agent):
     """Запоминает агента, который обслуживает все запросы."""
     _ServerState.agent = agent
-
 
 def _ensure_session():
     """Лениво создаёт единственное хранилище сессии диалога."""
@@ -400,13 +692,37 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(selected, list) or not selected:
             selected = None
 
+        # «ДОСКА» — особый сервер ВЫВОДА: запрос к ней обрабатывается через
+        # MCP-путь (с предварительным обновлением данных композицией) и
+        # НЕЗАВИСИМО от чекбокса «Использовать MCP». Для «Доски» применяется
+        # модель из селекта «модель MCP» (_ServerState.mcp_model), поэтому
+        # выбранная сверху модель и персона не нужны.
+        doska_srv = getattr(config, "COMPOSITION_DOSKA_SERVER", "doska")
+        is_doska = (_ServerState.mcp_server or "") == doska_srv
+        # РЕЖИМ КОМПОЗИЦИИ: пока композиция активна, ФОНОМ работают серверы
+        # «календарь → замполит → завхоз» (отрабатывают логику и обновляют
+        # данные), а ЛЮБОЕ обращение в чате ВСЕГДА идёт К «ДОСКЕ» — серверу
+        # ВЫВОДА (таблица «событие + время»). Выбранный в списке сервер и
+        # выбранная сверху модель/персона при этом НЕ важны: отвечает «Доска».
+        composition_active = bool(_ServerState.composition_running)
+        # На время композиции цель чата — «Доска» (детерминированный вывод).
+        target_is_board = is_doska or composition_active
+        # ЗАПРОС ИДЁТ ЧЕРЕЗ MCP, если ВКЛЮЧЁН ЧЕКБОКС «Использовать MCP»,
+        # ЛИБО выбран сервер «Доска» (запрос к ней не зависит от чекбокса),
+        # ЛИБО активна КОМПОЗИЦИЯ (тогда цель — всегда «Доска»).
+        # ВАЖНО: сам ФАКТ выбора сервера в списке (без чекбокса и без
+        # композиции) НЕ включает MCP-режим.
+        via_mcp = bool(_ServerState.mcp_enabled or target_is_board)
+
         # РЕЖИМ ОТВЕТА зависит от наличия персон:
         #   * ЕСТЬ активная персона — отвечает ПЕРСОНА, используя СВОЮ модель
         #     (выбор моделей сверху недоступен, но если клиент всё же прислал
         #     список — модель персоны имеет приоритет);
         #   * НЕТ персон — диалог идёт напрямую с ВЫБРАННЫМИ моделями.
+        # ВАЖНО: при запросе через MCP (в т.ч. к «Доске») модель берётся из
+        # селекта «модель MCP», а не из персон/моделей сверху.
         pid, pname, pmodel, pchar, pstyle = self.session.active_profile_attrs()
-        if pid:
+        if pid and not via_mcp:
             # Отвечает персона. Заголовок блока — имя персоны.
             answer_title = pname or "Персона"
             profile = {"name": pname, "character": pchar, "style": pstyle}
@@ -418,10 +734,10 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             elif selected is None:
                 selected = None  # агент опросит все доступные модели
         else:
-            # Персон нет — режим «напрямую с моделями».
+            # Персон нет (или запрос идёт через MCP) — режим «напрямую».
             answer_title = None
             profile = None
-            if selected is None and not _ServerState.mcp_enabled:
+            if selected is None and not via_mcp:
                 return self._send_json(200, {
                     "ok": False,
                     "error": "Не выбрана ни одна модель. Включите модель для "
@@ -496,13 +812,60 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         # запроса «покажи напоминания».
         reminders = _collect_due_reminders()
 
-        # ВЕТКА MCP: если MCP включён в интерфейсе — запрос идёт ЧЕРЕЗ MCP
-        # (модель выбирает инструмент, инструмент вызывается на MCP-сервере,
-        # его результат возвращается как ответ). Иначе — обычный путь агента.
-        if _ServerState.mcp_enabled:
-            print("[MCP] запрос идёт через MCP (server=%r, model=%r)"
+        # ВЕТКА MCP: запрос идёт ЧЕРЕЗ MCP, если MCP включён в интерфейсе ЛИБО
+        # выбран сервер «Доска» (запрос к ней не зависит от чекбокса).
+        # В этой ветке модель выбирает инструмент, инструмент вызывается на
+        # MCP-сервере, его результат возвращается как ответ.
+        if via_mcp:
+            print("[MCP] запрос идёт через MCP (server=%r, model=%r, "
+                  "board=%s, composition=%s)"
                   % (_ServerState.mcp_server or "default",
-                     _ServerState.mcp_model or "auto"), flush=True)
+                     _ServerState.mcp_model or "auto",
+                     target_is_board, composition_active), flush=True)
+            # ЦЕЛЬ ЗАПРОСА — СЕРВЕР ВЫВОДА «ДОСКА»: так при активной
+            # композиции ЛЮБОЕ обращение в чате всегда выводит таблицу
+            # «событие + время», независимо от выбранного в списке сервера.
+            # Перед выдачей таблицы ОБНОВЛЯЕМ данные до актуального состояния,
+            # прогнав композицию заново (календарь -> замполит -> завхоз):
+            # так на доске всегда свежие события, даже если фоновый тик ещё
+            # не успел их обновить.
+            if target_is_board:
+                print("[MCP] запрос к «Доске»: обновляю данные композицией…",
+                      flush=True)
+                try:
+                    refresh = _composition_run(verbose=False)
+                    if not refresh.get("ok"):
+                        print("[MCP] обновление «Доски» не удалось: %s"
+                              % refresh.get("error"), flush=True)
+                except Exception as exc:
+                    print("[MCP] обновление «Доски» не удалось: %s" % exc,
+                          flush=True)
+                # «ДОСКА» — сервер ВЫВОДА: инструмент показываем ДЕТЕРМИНИРОВАННО
+                # (show_board_html + show_board), НЕ доверяя выбор инструмента
+                # модели. Это исключает «ошибку доски», когда модель выбирала
+                # ping/неверный инструмент.
+                result = _board_direct_result(
+                    doska_srv, model=(_ServerState.mcp_model or None))
+                if result.get("ok"):
+                    self.session.append_turn(question, {
+                        "role": "assistant",
+                        "content": result.get("text", ""),
+                        "html": result.get("html", ""),
+                        "answers": result.get("answers", []),
+                        "meta": result.get("meta", ""),
+                        "usage": result.get("usage"),
+                    })
+                    result["compact"] = self.session.get_compact()
+                    result["strategy"] = self.session.get_strategy()
+                    result["facts"] = self.session.get_facts()
+                    result["branches"] = self.session.branches_state()
+                    result["memory"] = self.session.memory_state()
+                    result["task"] = self.session.get_task_state()
+                    result["invariants"] = self.session.invariants_state()
+                    result["context"] = self.session.context_stats()
+                if reminders:
+                    result["reminders"] = reminders
+                return self._send_json(200, result)
             tools = []
             if mcp_client is not None:
                 listed = mcp_client.mcp_list_tools(
@@ -512,6 +875,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 else:
                     print("[MCP] не удалось получить список инструментов: %s"
                           % listed.get("error"), flush=True)
+            # Модель для MCP-запроса — из селекта «модель MCP».
             result = self.agent.answer_via_mcp(
                 question, tools,
                 model=(_ServerState.mcp_model or None),
@@ -1006,6 +1370,15 @@ class WebRequestHandler(BaseHTTPRequestHandler):
 
         if action == "set":
             with _ServerState.mcp_lock:
+                # ВКЛЮЧЕНИЕ чекбокса «Использовать MCP» — ОСТАНАВЛИВАЕТ
+                # композицию и переводит сервер в режим отдельных серверов
+                # по выбору (композиция и MCP взаимоисключающие).
+                if "enabled" in data and bool(data.get("enabled")):
+                    if _ServerState.composition_running:
+                        _ServerState.composition_running = False
+                        _stop_composition_tick()
+                        print("[MCP] включён режим MCP — композиция остановлена.",
+                              flush=True)
                 if "enabled" in data:
                     _ServerState.mcp_enabled = bool(data.get("enabled"))
                 if "model" in data:
@@ -1017,6 +1390,64 @@ class WebRequestHandler(BaseHTTPRequestHandler):
 
         if action == "status":
             return self._send_json(200, _mcp_state_payload(check=True))
+
+        if action == "compose":
+            # КНОПКА «Запустить композицию»: прогоняем пайплайн
+            # календарь -> замполит -> завхоз и возвращаем отчёт.
+            #
+            # ВАЖНО: композиция и чекбокс «Использовать MCP» —
+            # ВЗАИМОИСКЛЮЧАЮЩИЕ. Запуск композиции:
+            #   * ВЫКЛЮЧАЕТ чекбокс «Использовать MCP» (mcp_enabled = False);
+            #   * включает РЕЖИМ КОМПОЗИЦИИ (composition_running = True) —
+            #     композиция работает САМА ПО СЕБЕ (фоновый тик);
+            #   * при этом ЗАПРОСЫ в чат обслуживает МОДЕЛЬ из селекта
+            #     «Модель MCP» через MCP-путь (см. _handle_ask: при активной
+            #     композиции via_mcp = True, модель берётся из mcp_model).
+            with _ServerState.mcp_lock:
+                _ServerState.mcp_enabled = False
+                _ServerState.composition_running = True
+                _save_mcp_settings()
+            # Запускаем фоновый тик композиции (если ещё не запущен).
+            _start_composition_tick()
+            # МОДЕЛЬ: сообщение о запуске формирует модель из селекта
+            # «Модель MCP» (_ServerState.mcp_model). Если модель не задана —
+            # берётся шаблон.
+            report = _composition_run(verbose=True)
+            payload = _mcp_state_payload(check=False)
+            payload["composition"] = report
+            # Отдельное СООБЩЕНИЕ для чата: какие MCP-серверы задействованы
+            # и что каждый делает (название + краткое описание). Текст генерит
+            # выбранная модель, шаблон — фолбэк.
+            template = _format_composition_message(report)
+            chooser = getattr(self, "agent", None)
+            model_label = _ServerState.mcp_model or ""
+            if chooser is not None and hasattr(chooser, "compose_message"):
+                gen = chooser.compose_message(
+                    _composition_report_text(report), model=model_label or None,
+                    fallback=template)
+                payload["composition_message"] = gen.get("text") or template
+                payload["composition_message_model"] = gen.get("model") or ""
+                payload["composition_message_ok"] = bool(gen.get("ok"))
+            else:
+                payload["composition_message"] = template
+                payload["composition_message_model"] = ""
+                payload["composition_message_ok"] = False
+            print("[COMPOSE] композиция запущена (MCP выключен); сообщение "
+                  "сформировано моделью %r (ok=%s)"
+                  % (payload.get("composition_message_model") or "шаблон",
+                     payload.get("composition_message_ok")), flush=True)
+            return self._send_json(200, payload)
+
+        if action == "compose_stop":
+            # Явная ОСТАНОВКА режима композиции (возврат к отдельным серверам
+            # по выбору). Обычно вызывается автоматически при включении
+            # чекбокса «Использовать MCP», но можно и напрямую.
+            with _ServerState.mcp_lock:
+                _ServerState.composition_running = False
+                _stop_composition_tick()
+                _save_mcp_settings()
+            print("[COMPOSE] режим композиции остановлен.", flush=True)
+            return self._send_json(200, _mcp_state_payload(check=False))
 
         # action == "state" и всё прочее — отдаём состояние без проверки.
         return self._send_json(200, _mcp_state_payload(check=False))
@@ -1046,6 +1477,60 @@ def _open_browser_later(url, delay=1.0):
     threading.Thread(target=_job, daemon=True).start()
 
 
+def _composition_tick_loop(interval, stop_event):
+    """Фоновый ТИК композиции: раз в interval секунд прогоняет пайплайн.
+
+    По задаче (docs/task5.md) «календарь проверяет каждую минуту состояние
+    событий на ближайшие 7 дней». Тик работает ТОЛЬКО в режиме композиции:
+    его останавливают (stop_event) при включении чекбокса «Использовать MCP».
+    Ошибки логируются и НЕ останавливают цикл.
+    """
+    print("[COMPOSE] фоновый тик композиции: каждые %d c." % interval, flush=True)
+    while not stop_event.is_set():
+        # Ждём интервал, но просыпаемся сразу при остановке.
+        if stop_event.wait(interval):
+            break
+        if not _ServerState.composition_running:
+            break
+        try:
+            report = _composition_run(verbose=False)
+            if not report.get("ok"):
+                print("[COMPOSE] тик: %s" % report.get("error"), flush=True)
+        except Exception as exc:
+            print("[COMPOSE] тик не удался: %s" % exc, flush=True)
+    print("[COMPOSE] фоновый тик композиции остановлен.", flush=True)
+
+
+def _start_composition_tick():
+    """Запускает фоновый тик композиции (режим композиции ВКЛючён).
+
+    Если тик уже запущен — ничего не делает. Тик перестаёт работать при
+    выключении режима композиции (см. _stop_composition_tick).
+    """
+    interval = int(getattr(config, "COMPOSITION_TICK_SECONDS", 0) or 0)
+    if interval <= 0:
+        print("[COMPOSE] фоновый тик выключен (COMPOSITION_TICK_SECONDS=0).",
+              flush=True)
+        return
+    if _ServerState.composition_thread and _ServerState.composition_thread.is_alive():
+        return
+    stop_event = threading.Event()
+    _ServerState.composition_stop = stop_event
+    th = threading.Thread(target=_composition_tick_loop,
+                          args=(interval, stop_event), daemon=True)
+    _ServerState.composition_thread = th
+    th.start()
+
+
+def _stop_composition_tick():
+    """Останавливает фоновый тик композиции (режим композиции ВЫКлючён)."""
+    stop_event = _ServerState.composition_stop
+    if stop_event is not None:
+        stop_event.set()
+    _ServerState.composition_stop = None
+    _ServerState.composition_thread = None
+
+
 def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     """Запускает сервер, используя агента в качестве единой сущности.
 
@@ -1068,6 +1553,15 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     url = "http://%s:%s/" % (shown_host, shown_port)
     print("[WEB] Сервер запущен: %s" % url)
     print("[WEB] Агент обслуживает модели: %s" % agent.label)
+    # Фоновый ТИК композиции запускаем ТОЛЬКО если режим композиции был
+    # сохранён как активный (взаимоисключает чекбокс «Использовать MCP»).
+    if _ServerState.composition_running and not _ServerState.mcp_enabled:
+        print("[COMPOSE] восстановлен режим композиции из настроек.", flush=True)
+        _start_composition_tick()
+    else:
+        _ServerState.composition_running = False
+        print("[COMPOSE] режим композиции не активен (работают отдельные "
+              "серверы по выбору).", flush=True)
     if open_page:
         _open_browser_later(url)
     print("[WEB] Остановка: нажмите Ctrl+C.")
@@ -1076,6 +1570,7 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     except KeyboardInterrupt:
         print("\n[WEB] Остановка...")
     finally:
+        _stop_composition_tick()
         httpd.server_close()
 
 

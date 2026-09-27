@@ -142,8 +142,15 @@
                     <span id="mcp-status" class="mcp-status"></span>
                 </div>
                 <div id="mcp-tools" class="mcp-tools" hidden></div>
+                <!-- КОМПОЗИЦИЯ (task5): запуск пайплайна нескольких MCP-серверов
+                     календарь -> замполит -> завхоз (доска — вывод таблицей). -->
+                <div class="mcp-status-row">
+                    <button id="mcp-compose" type="button" class="btn-side primary"
+                            title="Запустить композицию: календарь → замполит → завхоз">Запустить композицию</button>
+                </div>
+                <div id="mcp-compose-status" class="mcp-compose-status" hidden></div>
             </div>
-            <span class="side-note">инструменты MCP-сервера: подключение, список инструментов и модель ответа</span>
+            <span class="side-note">MCP: подключение, инструменты, модель ответа, композиция</span>
 
             <!-- Summary: автоматическое сжатие истории (без кнопки).
                  Summary генерируется само после накопления указанного

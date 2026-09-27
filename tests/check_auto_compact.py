@@ -61,6 +61,12 @@ def main():
 
     from web import server
 
+    # Этот тест проверяет НОРМАЛЬНЫЙ путь чата (сжатие/память/персоны), а не
+    # MCP. Форсируем «не-MCP» режим: чекбокс выключен и НИ ОДИН MCP-сервер не
+    # выбран (иначе запрос ушёл бы MCP-путём — см. web/server.py: _handle_ask).
+    server._ServerState.mcp_enabled = False
+    server._ServerState.mcp_server = ""
+
     fake = FakeAgent()
     httpd = server.create_server(fake, host="127.0.0.1", port=0)
     port = httpd.server_address[1]

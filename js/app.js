@@ -1526,14 +1526,23 @@
         var question = qEl.value.trim();
         if (!question || busy) { if (!question) setStatus("Введите запрос.", "error"); return; }
 
-        // ДВА РЕЖИМА:
+        // РЕЖИМЫ:
         //   * есть активная персона — отвечает она СВОЕЙ моделью,
         //     выбор моделей сверху недоступен;
         //   * персон нет — диалог идёт напрямую с выбранными моделями.
-        // Включён MCP с выбранной моделью — модель сверху и
-        // персона не нужны (запрос пойдёт через MCP на сервере).
-        var mcpReady = !!(mcpState && mcpState.enabled &&
-                          (mcpState.model || mcpState.available));
+        // ОСОБЫЙ СЛУЧАЙ — MCP: запрос идёт через MCP (модель берётся из
+        // селекта «Модель MCP», ответ — таблицей «Доски») ТОЛЬКО если:
+        //   * ВКЛЮЧЁН чекбокс «Использовать MCP», ЛИБО
+        //   * выбран сервер «Доска» (запрос к ней не зависит от чекбокса), ЛИБО
+        //   * АКТИВНА КОМПОЗИЦИЯ (фоном работают календарь→замполит→завхоз, а
+        //     обращение в чате ВСЕГДА идёт к «Доске»).
+        // В этих случаях выбранная сверху модель/персона НЕ требуются.
+        // ВАЖНО: сам ВЫБОР сервера в списке (без чекбокса и без композиции)
+        // MCP-режим НЕ включает.
+        var doskaSelected = !!(mcpState && mcpState.server === DOSKA_SERVER);
+        var compositionActive = !!(mcpState && mcpState.composition);
+        var mcpReady = compositionActive || doskaSelected ||
+            !!(mcpState && mcpState.enabled && (mcpState.model || mcpState.available));
         if (!hasActiveProfile() && !hasSelectedModel() && !mcpReady) {
             setStatus("Выберите модель или создайте персону.", "error");
             return;
@@ -1724,10 +1733,18 @@
     var mcpCheckBtn = document.getElementById("mcp-check");
     var mcpStatusEl = document.getElementById("mcp-status");
     var mcpToolsEl = document.getElementById("mcp-tools");
+    // КОМПОЗИЦИЯ (task5): кнопка запуска пайплайна и поле отчёта.
+    var mcpComposeBtn = document.getElementById("mcp-compose");
+    var mcpComposeStatus = document.getElementById("mcp-compose-status");
 
     // Локальный снимок настроек MCP.
     var mcpState = { enabled: false, server: "", servers: [],
-                     model: "", status: null, available: false };
+                     model: "", status: null, available: false,
+                     composition: false };
+
+    // id сервера «Доска»: запрос к нему обрабатывается MCP-путём
+    // независимо от чекбокса «Использовать MCP» (см. docs/task5.md).
+    var DOSKA_SERVER = "doska";
 
     // Заполняет селект доступных MCP-серверов (демо / календарь).
     function fillMcpServerSelect(servers) {
@@ -1805,6 +1822,12 @@
         if (!d) return;
         mcpState.enabled = !!d.enabled;
         mcpState.available = !!d.available;
+        // РЕЖИМ КОМПОЗИЦИИ (взаимоисключающий с «Использовать MCP»).
+        // Ключ composition_running — булев; "composition" в ответе на запуск
+        // композиции содержит ОТЧЁТ прогона (его обрабатывает кнопка).
+        if (typeof d.composition_running === "boolean") {
+            mcpState.composition = d.composition_running;
+        }
         if (Array.isArray(d.servers) && d.servers.length) {
             mcpState.servers = d.servers;
         }
@@ -1821,6 +1844,31 @@
         if (d.available === false && !d.status && mcpStatusEl) {
             mcpStatusEl.textContent = "MCP недоступен";
             mcpStatusEl.className = "mcp-status error";
+        }
+        syncComposeModeUI();
+    }
+
+    // Отражает режим композиции в интерфейсе: при активной композиции
+    // чекбокс «Использовать MCP» выключен, а выбранный сервер НЕ применяется
+    // к обычным запросам (композиция работает сама по себе).
+    function syncComposeModeUI() {
+        var on = !!mcpState.composition;
+        if (mcpComposeBtn) {
+            mcpComposeBtn.classList.toggle("active", on);
+            mcpComposeBtn.title = on
+                ? "Композиция запущена (работает сама по себе). "
+                  + "Включение «Использовать MCP» остановит её."
+                : "Запустить композицию (взаимоисключающе с «Использовать MCP»)";
+        }
+        if (on && mcpComposeStatus && mcpComposeStatus.hidden) {
+            // Показываем, что режим композиции активен.
+            mcpComposeStatus.hidden = false;
+            mcpComposeStatus.className = "mcp-compose-status ok";
+            mcpComposeStatus.textContent = "композиция активна (MCP выключен)";
+        }
+        if (on && mcpStatusEl && (!mcpState.status || !mcpState.status.ok)) {
+            mcpStatusEl.textContent = "режим композиции";
+            mcpStatusEl.className = "mcp-status ok";
         }
     }
 
@@ -1850,8 +1898,18 @@
 
     if (mcpEnabledEl) {
         mcpEnabledEl.addEventListener("change", function () {
-            setStatus(mcpEnabledEl.checked ? "MCP включён." : "MCP выключен.", "ok");
-            mcpAction("set", { enabled: mcpEnabledEl.checked });
+            var on = mcpEnabledEl.checked;
+            if (on) {
+                // ВКЛЮЧЕНИЕ MCP ОСТАНАВЛИВАЕТ композицию (взаимоисключающе):
+                // переходим в режим отдельных серверов по выбору.
+                setStatus(mcpState.composition
+                    ? "MCP включён. Композиция остановлена — работают отдельные серверы по выбору."
+                    : "MCP включён.", "ok");
+            } else {
+                setStatus("MCP выключен.", "ok");
+            }
+            // Сервер сам выключит режим композиции при enabled=true.
+            mcpAction("set", { enabled: on });
         });
     }
         if (mcpServerSel) {
@@ -1882,6 +1940,78 @@
                 mcpCheckBtn.disabled = false;
             });
         });
+    }
+
+    // Показывает отчёт о запуске композиции (календарь → замполит → завхоз).
+    // model — метка модели из селекта «Модель MCP», сформировавшей сообщение.
+    function renderComposeStatus(rep, model) {
+        if (!mcpComposeStatus) return;
+        if (!rep) {
+            mcpComposeStatus.hidden = true;
+            mcpComposeStatus.textContent = "";
+            return;
+        }
+        mcpComposeStatus.hidden = false;
+        var byModel = model ? (" · модель: " + model) : "";
+        if (rep.ok) {
+            mcpComposeStatus.className = "mcp-compose-status ok";
+            mcpComposeStatus.textContent =
+                "композиция выполнена: " + (rep.detail || "") +
+                (rep.saved ? (" · " + rep.saved) : "") + byModel;
+        } else {
+            mcpComposeStatus.className = "mcp-compose-status error";
+            mcpComposeStatus.textContent = "ошибка: " + (rep.error || "?") + byModel;
+        }
+        mcpComposeStatus.title = JSON.stringify(rep.steps || [], null, 1);
+    }
+
+    if (mcpComposeBtn) {
+        mcpComposeBtn.addEventListener("click", function () {
+            mcpComposeBtn.disabled = true;
+            if (mcpComposeStatus) {
+                mcpComposeStatus.hidden = false;
+                mcpComposeStatus.className = "mcp-compose-status";
+                mcpComposeStatus.textContent = "запускаю композицию…";
+            }
+            mcpAction("compose")
+                .then(function (d) {
+                    if (d && d.composition) {
+                        renderComposeStatus(d.composition,
+                                            d.composition_message_model);
+                    } else {
+                        renderComposeStatus({ ok: false, error: "нет отчёта" });
+                    }
+                    // Композиция включилась, чекбокс «Использовать MCP» на
+                    // сервере выключен — сообщаем пользователю режим работы.
+                    if (d && d.composition && d.composition.ok) {
+                        setStatus("Композиция запущена (MCP выключен — работает сама по себе).",
+                                  "ok");
+                    }
+                    // ОТДЕЛЬНОЕ СООБЩЕНИЕ в чат: какие MCP-серверы задействованы
+                    // и что каждый делает (названия + краткое описание).
+                    // Текст генерит модель из селекта «Модель MCP».
+                    var msg = d && d.composition_message;
+                    if (msg) {
+                        pushCompositionMessage(msg);
+                    }
+                })
+                .finally(function () { mcpComposeBtn.disabled = false; });
+        });
+    }
+
+    // Показывает ОТДЕЛЬНОЕ сообщение композиции в потоке чата (как ответ
+    // «ассистента»): список MCP-серверов с кратким описанием их работы.
+    // Простейший Markdown -> HTML: **жирный** и строки-пункты «- …».
+    function pushCompositionMessage(text) {
+        var html = esc(text)
+            .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+            .split("\n").map(function (ln) {
+                return /^\s*-\s+/.test(ln)
+                    ? '<div class="compose-li">' + ln.replace(/^\s*-\s+/, "• ") + "</div>"
+                    : (ln ? "<div>" + ln + "</div>" : "<div>&nbsp;</div>");
+            }).join("");
+        items.push({ role: "assistant", content: text, html: html });
+        render();
     }
 
 

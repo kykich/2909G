@@ -563,6 +563,55 @@ class Agent:
             memory_used={"working": 0, "longterm": 0},
             mcp={"tool": tool_name, "arguments": args, "result": result_text})
 
+    def compose_message(self, report_text, model=None, fallback=""):
+        """Формирует СООБЩЕНИЕ о запуске композиции MCP СИЛАМИ МОДЕЛИ.
+
+        Композиция (календарь → замполит → завхоз) — детерминированный
+        пайплайн MCP-серверов. Чтобы задействовать модель, выбранную в
+        селекте «Модель MCP», текст-сообщение о результате прогона
+        генерирует именно ЭТА модель: она получает сводку пайплайна и
+        отвечает коротким понятным сообщением для чата.
+
+        report_text — текстовая сводка результата композиции (серверы,
+                       события, сохранённые данные).
+        model       — метка модели («GigaChat»/«DeepSeek-flash») или None
+                       (тогда используется модель по умолчанию).
+        fallback    — запасной текст, если модель недоступна/не ответила.
+
+        Возвращает dict: {ok, text, model, error}. При ошибке модели
+        возвращает fallback (ok=False), чтобы сообщение всё равно показалось.
+        """
+        provider, model_name = self._resolve_model(model)
+        label = str(model or "").strip() or model_name
+        system = ("Ты — ассистент, который кратко отчитывается о запуске "
+                  "композиции MCP-серверов. Отвечай по-русски, дружелюбно, "
+                  "1–3 предложениями, без markdown-таблиц.")
+        user = ("Запущена КОМПОЗИЦИЯ MCP-серверов. Сводка прогона:\n\n"
+                + str(report_text or "") +
+                "\n\nСформируй короткое сообщение для чата: что сделала "
+                "композиция и какой итог (сколько событий обработано и что "
+                "сохранено). Не выдумывай данные, которых нет в сводке.")
+        try:
+            res = self._chat_text(provider, model_name, [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ], temperature=0.3)
+            content = res.get("content", "") if isinstance(res, dict) else str(res)
+            text = str(content or "").strip()
+            if text:
+                print("[COMPOSE] сообщение сгенерировано моделью %s" % label,
+                      flush=True)
+                return {"ok": True, "text": text, "model": label, "error": None}
+            print("[COMPOSE] модель %s вернула пустой текст — fallback" % label,
+                  flush=True)
+            return {"ok": False, "text": fallback, "model": label,
+                    "error": "Пустой ответ модели."}
+        except Exception as exc:
+            print("[COMPOSE] сообщение: модель %s недоступна (%s) — fallback"
+                  % (label, exc), flush=True)
+            return {"ok": False, "text": fallback, "model": label,
+                    "error": str(exc)}
+
     @staticmethod
     def _parse_mcp_decision(text):
         """Разбирает JSON-решение модели о вызове MCP-инструмента.
