@@ -55,6 +55,12 @@ from .mcp import (
 from .calendar import (
     YANDEX_CALDAV_URL, YA_CRED_FILE, CALENDAR_TZ,
 )
+from .rag import (
+    RAG_DOCS_DIR, RAG_EMBED_MODEL, RAG_OLLAMA_URL,
+    RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP,
+    RAG_TOP_K, RAG_SIMILARITY_THRESHOLD,
+    RAG_STORE_DIR, RAG_ENABLED,
+)
 
 # --- Параметры генерации по умолчанию ---
 DEFAULT_TEMPERATURE = 0.7
@@ -70,7 +76,7 @@ MAX_TOKENS_STEP = 50
 
 # --- Сессии диалога ---
 import os
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSION_DIR = os.path.join(BASE_DIR, "..", "session")
 SESSION_FILE = os.path.join(SESSION_DIR, "session.json")
 

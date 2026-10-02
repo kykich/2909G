@@ -44,6 +44,53 @@
 
     var busy = false;
 
+    // ===== Сворачиваемые блоки левой колонки =====
+    var sections = document.querySelectorAll(".side-section");
+    sections.forEach(function (sec) {
+        var title = sec.querySelector(".side-title");
+        if (!title) return;
+        title.addEventListener("click", function () {
+            sec.classList.toggle("collapsed");
+        });
+    });
+
+    // Обновление класса has-content для свёрнутых блоков:
+    // has-content = есть контент (не просто заглушка)
+    function updateSectionContent() {
+        sections.forEach(function (sec) {
+            var body = sec.querySelector(".section-body");
+            if (!body) return;
+            var id = sec.getAttribute("data-section");
+            var hasContent = false;
+            if (id === "task") {
+                var tb = document.getElementById("task-box");
+                hasContent = tb && (tb.classList.contains("active")
+                    || tb.classList.contains("paused")
+                    || tb.classList.contains("done")
+                    || tb.querySelector(".task-goal"));
+            } else if (id === "profiles") {
+                var pb = document.getElementById("profiles-box");
+                hasContent = pb && pb.querySelector(".profile-row");
+            } else if (id === "invariants") {
+                var ib = document.getElementById("invariants-box");
+                hasContent = ib && ib.querySelector(".invariant-row");
+            } else if (id === "mcp") {
+                var mcpCb = document.getElementById("mcp-enabled");
+                hasContent = mcpCb && mcpCb.checked;
+            } else if (id === "rag") {
+                var ragCb = document.getElementById("rag-enabled");
+                hasContent = ragCb && ragCb.checked;
+            } else {
+                // Стратегия, Summary, Память — всегда есть контент
+                hasContent = true;
+            }
+            sec.classList.toggle("has-content", hasContent);
+        });
+    }
+    // Вызываем при загрузке и после каждого ответа
+    updateSectionContent();
+    var origAppendTurn = window._origAppendTurn;
+
     // Текущий диалог в окне: [{role:'user'|'assistant', content, html, answers}]
     var items = [];
 
@@ -751,6 +798,7 @@
         if (taskFinishBtn) taskFinishBtn.disabled = !canFinish;
         if (taskResetBtn) taskResetBtn.disabled = !canReset;
         if (taskGoalInp) taskGoalInp.disabled = active && stage !== "done";
+        updateSectionContent();
     }
 
     // Отправляет действие с задачей на сервер и применяет ответ.
@@ -888,6 +936,7 @@
 
             invariantsBox.appendChild(row);
         });
+        updateSectionContent();
     }
 
     // Отправляет действие с инвариантами на сервер и применяет ответ.
@@ -1426,6 +1475,7 @@
             profilesBox.appendChild(row);
         });
         updateModelBarMode();
+        updateSectionContent();
     }
 
     // Применяет снимок, пришедший от сервера после действий с профилями:
@@ -1554,12 +1604,14 @@
         qEl.value = "";
 
         // Сервер сам держит историю диалога; передаём вопрос, выбор моделей
-        // и настройки сжатия/стратегии.
+        // и настройки сжатия/стратегии/RAG.
         var body = {
             question: question,
             models: selectedModelsPayload(),
             compact: getCompactPayload(),
             strategy: getStrategyPayload(),
+            rag_enabled: ragEnabledEl && ragEnabledEl.checked,
+            rag_query: question,  // используем вопрос как запрос к RAG
         };
 
         fetch("/api/ask", {
@@ -1599,6 +1651,7 @@
             if (data.task) renderTask(data.task);
             if (data.invariants) renderInvariants(data.invariants);
             renderTrace(data.trace, data.meta);
+            updateSectionContent();
         })
         .catch(function (err) { setStatus("Ошибка связи: " + err.message, "error"); })
         .finally(function () {
@@ -1628,6 +1681,7 @@
         renderTask({ active: false, stage: "planning", paused: false,
                      stages: ["planning", "execution", "validation", "done"],
                      stage_labels: taskState.stage_labels || {} });
+        updateSectionContent();
         setStatus(statusText, "ok");
         qEl.focus();
     }
@@ -1846,6 +1900,7 @@
             mcpStatusEl.className = "mcp-status error";
         }
         syncComposeModeUI();
+        updateSectionContent();
     }
 
     // Отражает режим композиции в интерфейсе: при активной композиции
@@ -1998,6 +2053,83 @@
                 .finally(function () { mcpComposeBtn.disabled = false; });
         });
     }
+
+    // ------------------------------------------------------------------
+    // RAG (Retrieval-Augmented Generation)
+    // ------------------------------------------------------------------
+    var ragEnabledEl = document.getElementById("rag-enabled");
+    var ragDocsDirEl = document.getElementById("rag-docs-dir");
+    var ragIndexBtn = document.getElementById("rag-index");
+    var ragStatusEl = document.getElementById("rag-status");
+
+    // Показывает статус RAG
+    function renderRagStatus(d) {
+        if (!ragStatusEl) return;
+        if (!d || !d.ok) {
+            ragStatusEl.hidden = true;
+            return;
+        }
+        ragStatusEl.hidden = false;
+        ragStatusEl.className = "mcp-compose-status ok";
+        ragStatusEl.textContent = "Документов: " + (d.count || 0) +
+            " | Папка: " + (d.docs_dir || "не задана");
+    }
+
+    // Загружает статус RAG при старте
+    function loadRagStatus() {
+        fetch("/api/rag", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "status" }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (d) { renderRagStatus(d); })
+        .catch(function () {});
+    }
+
+    // Индексирует документы
+    if (ragIndexBtn) {
+        ragIndexBtn.addEventListener("click", function () {
+            var docsDir = ragDocsDirEl ? ragDocsDirEl.value.trim() : "";
+            if (!docsDir) {
+                setStatus("Укажите путь к папке с документами.", "error");
+                return;
+            }
+            ragIndexBtn.disabled = true;
+            if (ragStatusEl) {
+                ragStatusEl.hidden = false;
+                ragStatusEl.className = "mcp-compose-status";
+                ragStatusEl.textContent = "индексирую…";
+            }
+            fetch("/api/rag", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "index", docs_dir: docsDir }),
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.ok) {
+                    setStatus(d.detail || "Индексация завершена.", "ok");
+                    renderRagStatus(d);
+                } else {
+                    setStatus("Ошибка индексации: " + (d.detail || ""), "error");
+                }
+                if (ragStatusEl) {
+                    ragStatusEl.className = d.ok ? "mcp-compose-status ok" : "mcp-compose-status error";
+                    ragStatusEl.textContent = d.detail || "";
+                }
+            })
+            .catch(function (err) {
+                setStatus("Ошибка связи: " + err.message, "error");
+            })
+            .finally(function () {
+                ragIndexBtn.disabled = false;
+            });
+        });
+    }
+
+    // Загружаем статус RAG при старте
+    loadRagStatus();
 
     // Показывает ОТДЕЛЬНОЕ сообщение композиции в потоке чата (как ответ
     // «ассистента»): список MCP-серверов с кратким описанием их работы.

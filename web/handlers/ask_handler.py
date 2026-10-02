@@ -1,19 +1,43 @@
-"""Обработчик POST /api/ask — основная логика запроса к модели/MCP (mixin)."""
+"""Обработчик POST /api/ask — основная логика запроса к модели/MCP."""
 import urllib.parse
 
 from rtk_app import config
 
 
 class AskHandler:
-    """Обработка POST /api/ask: выбор режима (LLM vs MCP) и обработка ответа."""
+    """Обработчик POST /api/ask: выбор режима (LLM vs MCP) и обработка ответа."""
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/ask":
             return self._handle_ask()
-        # Остальные POST-эндпоинты — делегируем ApiHandler.
-        from .api_handler import ApiHandler
-        return ApiHandler.do_POST(self)
+        if path == "/api/newchat":
+            self.session.reset()
+            return self._send_json(200, {"ok": True,
+                                          "messages": self.session.snapshot()})
+        if path == "/api/compact":
+            return self._handle_compact()
+        if path == "/api/compact_summary":
+            return self._handle_compact_summary()
+        if path == "/api/strategy":
+            return self._handle_strategy()
+        if path == "/api/facts":
+            return self._handle_facts()
+        if path == "/api/memory":
+            return self._handle_memory()
+        if path == "/api/branches":
+            return self._handle_branches()
+        if path == "/api/task":
+            return self._handle_task()
+        if path == "/api/invariants":
+            return self._handle_invariants()
+        if path == "/api/profiles":
+            return self._handle_profiles()
+        if path == "/api/mcp":
+            return self._handle_mcp()
+        if path == "/api/rag":
+            return self._handle_rag()
+        self._send_json(404, {"ok": False, "error": "Not Found"})
 
     def _maybe_auto_compact(self):
         """Инкрементное сжатие истории: дописывает вытесненные сообщения."""
@@ -110,6 +134,10 @@ class AskHandler:
             print("[INVARIANT] инвариантов в запросе: %d" % len(invariants),
                   flush=True)
 
+        # RAG: извлекаем параметры из запроса
+        rag_enabled = bool(data.get("rag_enabled", False))
+        rag_query = data.get("rag_query") or question  # если не задан — используем вопрос
+
         reminders = mcp_helpers.collect_due_reminders()
 
         if via_mcp:
@@ -153,18 +181,17 @@ class AskHandler:
                     result["reminders"] = reminders
                 return self._send_json(200, result)
             tools = []
-            if "mcp_client" in dir() or True:
-                try:
-                    from rtk_app import mcp_client as mc
-                    listed = mc.mcp_list_tools(
-                        server_id=(srv_state._ServerState.mcp_server or None))
-                    if listed.get("ok"):
-                        tools = listed.get("tools", [])
-                    else:
-                        print("[MCP] не удалось получить список инструментов: %s"
-                              % listed.get("error"), flush=True)
-                except Exception:
-                    pass
+            try:
+                from rtk_app import mcp_client as mc
+                listed = mc.mcp_list_tools(
+                    server_id=(srv_state._ServerState.mcp_server or None))
+                if listed.get("ok"):
+                    tools = listed.get("tools", [])
+                else:
+                    print("[MCP] не удалось получить список инструментов: %s"
+                          % listed.get("error"), flush=True)
+            except Exception:
+                pass
             result = self.agent.answer_via_mcp(
                 question, tools,
                 model=(srv_state._ServerState.mcp_model or None),
@@ -177,7 +204,9 @@ class AskHandler:
                                         profile=profile,
                                         answer_title=answer_title,
                                         task_state=task_state,
-                                        invariants=invariants)
+                                        invariants=invariants,
+                                        rag_enabled=rag_enabled,
+                                        rag_query=rag_query)
         if result.get("ok"):
             self.session.append_turn(question, {
                 "role": "assistant",
@@ -245,3 +274,36 @@ class AskHandler:
                 self.session.set_facts(facts)
         except Exception as exc:
             print("[FACTS] обновление не удалось: %s" % exc, flush=True)
+
+    def _handle_rag(self):
+        """Обработчик POST /api/rag: индексация, статус, поиск."""
+        import rtk_app.rag as rag_module
+        data = self._read_json_body() or {}
+        action = str(data.get("action", "status")).strip().lower()
+
+        if action == "index":
+            docs_dir = data.get("docs_dir")
+            result = rag_module.index_documents(docs_dir)
+            return self._send_json(200, result)
+
+        if action == "status":
+            status = rag_module.get_status()
+            return self._send_json(200, status)
+
+        if action == "reset":
+            result = rag_module.reset_store()
+            return self._send_json(200, result)
+
+        if action == "query":
+            query = data.get("query", "")
+            top_k = data.get("top_k", config.RAG_TOP_K)
+            threshold = data.get("threshold", config.RAG_SIMILARITY_THRESHOLD)
+            if not query:
+                return self._send_json(200, {"matches": []})
+            matches = rag_module.retrieve(query, top_k=top_k,
+                                          threshold=threshold)
+            return self._send_json(200, {"matches": matches})
+
+        # По умолчанию — статус
+        status = rag_module.get_status()
+        return self._send_json(200, status)

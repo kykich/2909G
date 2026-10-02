@@ -5,7 +5,7 @@
 """
 import os
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # --- DeepSeek ---
 DS_API_URL = "https://api.deepseek.com/chat/completions"

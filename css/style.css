@@ -112,6 +112,48 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 .side-status.error { background: #5a2a33; color: #ffb9c2; }
 .side-status.ok { background: #1f4436; color: #b4f0cf; }
 
+/* ===== Сворачиваемые блоки левой колонки ===== */
+.side-section {
+    position: relative;
+    margin-bottom: 4px;
+    border-radius: 6px;
+    transition: background .2s;
+}
+.side-section .side-title {
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.side-section .side-title::before {
+    content: "▾";
+    font-size: .7rem;
+    transition: transform .2s;
+    display: inline-block;
+    width: 12px;
+    flex-shrink: 0;
+}
+.side-section.collapsed .side-title::before {
+    transform: rotate(-90deg);
+}
+.side-section .section-body {
+    transition: max-height .3s ease, opacity .2s;
+    overflow: hidden;
+}
+.side-section.collapsed .section-body {
+    max-height: 0 !important;
+    opacity: 0;
+}
+/* Свёрнутый + НЕ активен (пустой) — приглушённый серый */
+.side-section.collapsed:not(.has-content) {
+    background: rgba(0, 0, 0, 0.04);
+}
+/* Свёрнутый + активен (есть контент) — оливковый */
+.side-section.collapsed.has-content {
+    background: rgba(128, 128, 0, 0.15);
+}
+
 /* ===== СПРАВА: занимает всё оставшееся место ===== */
 .chat {
     flex: 1 1 auto;

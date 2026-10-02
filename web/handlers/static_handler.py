@@ -1,11 +1,11 @@
-"""Обработчик статических файлов и GET-запросов к API (mixin)."""
+"""Обработчик статических файлов и GET-запросов к API."""
 import urllib.parse
 
 from rtk_app import config
 
 
 class StaticHandler:
-    """Обработка GET-запросов: статика и GET-эндпоинты API."""
+    """Обработчик GET-запросов: статика и GET-эндпоинты API."""
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"

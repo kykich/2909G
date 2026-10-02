@@ -1,27 +1,18 @@
-"""Обработчик POST /api/mcp — управление MCP и композицией (mixin)."""
+"""Обработчик POST /api/mcp — управление MCP и композицией."""
 import threading
 import urllib.parse
 
 from rtk_app import config
+from ..mcp_settings import mcp_state_payload, save_mcp_settings
+from ..mcp_orchestrator import composition_run, format_composition_message, composition_report_text
+from .. import state as srv_state
 
 
 class McpHandler:
-    """Обработка POST /api/mcp: state/set/status/compose/compose_stop."""
-
-    def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/api/mcp":
-            return self._handle_mcp()
-        # Остальные POST-эндпоинты делегируем AskHandler.
-        from .ask_handler import AskHandler
-        return AskHandler.do_POST(self)
+    """Миксин: обработчик POST /api/mcp + фоновый тик композиции."""
 
     def _handle_mcp(self):
         """Управление MCP: чтение/запись настроек и проверка статуса."""
-        from ..mcp_settings import mcp_state_payload, save_mcp_settings
-        from ..mcp_orchestrator import composition_run, format_composition_message, composition_report_text
-        from .. import state as srv_state
-
         data = self._read_json_body() or {}
         action = str(data.get("action", "state")).strip().lower()
 
@@ -86,13 +77,12 @@ class McpHandler:
 
 
 # ---------------------------------------------------------------------------
-# Фоновый тик композиции (перенесён из server.py)
+# Фоновый тик композиции
 # ---------------------------------------------------------------------------
 
 def _composition_tick_loop(interval, stop_event):
     """Фоновый ТИК композиции: раз в interval секунд прогоняет пайплайн."""
     from ..mcp_orchestrator import composition_run
-    from .. import state as srv_state
     print("[COMPOSE] фоновый тик композиции: каждые %d c." % interval, flush=True)
     while not stop_event.is_set():
         if stop_event.wait(interval):
@@ -110,7 +100,6 @@ def _composition_tick_loop(interval, stop_event):
 
 def _start_composition_tick():
     """Запускает фоновый тик композиции (режим композиции ВКЛючён)."""
-    from .. import state as srv_state
     interval = int(getattr(config, "COMPOSITION_TICK_SECONDS", 0) or 0)
     if interval <= 0:
         print("[COMPOSE] фоновый тик выключен (COMPOSITION_TICK_SECONDS=0).",
@@ -128,7 +117,6 @@ def _start_composition_tick():
 
 def _stop_composition_tick():
     """Останавливает фоновый тик композиции (режим композиции ВЫКЛючён)."""
-    from .. import state as srv_state
     stop_event = srv_state._ServerState.composition_stop
     if stop_event is not None:
         stop_event.set()

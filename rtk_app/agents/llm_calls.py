@@ -66,7 +66,7 @@ class LLMCaller:
             }
 
     def _build_messages(self, history, question, profile=None, task_state=None,
-                        invariants=None):
+                        invariants=None, rag_enabled=False, rag_query=None):
         """Собирает полный список сообщений для API."""
         system_parts = [SYSTEM_PROMPT]
         prof_prompt = self.profile_system_prompt(profile)
@@ -78,6 +78,22 @@ class LLMCaller:
         inv_prompt = self.invariants_system_prompt(invariants)
         if inv_prompt:
             system_parts.append(inv_prompt)
+
+        # RAG: добавляем релевантные чанки из документов
+        rag_context = ""
+        if rag_enabled and rag_query:
+            try:
+                from ..rag import retrieve, build_context
+                matches = retrieve(rag_query)
+                if matches:
+                    rag_context = build_context(matches)
+                    system_parts.append(
+                        "ОСНОВЫВАЙСЯ НА СЛЕДУЮЩИХ ФАКТАХ ИЗ ДОКУМЕНТОВ:\n"
+                        + rag_context
+                    )
+            except Exception:
+                pass  # RAG не критичен — молча пропускаем
+
         dialog = []
         if isinstance(history, list):
             for m in history:

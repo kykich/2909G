@@ -1,39 +1,11 @@
-"""Обработчик POST-запросов: /api/newchat, /api/compact, /api/strategy и т.д. (mixin)."""
+"""Вспомогательные обработчики POST-эндпоинтов."""
 import urllib.parse
+
+from rtk_app import config
 
 
 class ApiHandler:
-    """Обработчики простых POST-эндпоинтов (не /api/ask, не /api/mcp)."""
-
-    def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/api/ask":
-            return self._handle_ask()
-        if path == "/api/newchat":
-            self.session.reset()
-            return self._send_json(200, {"ok": True,
-                                          "messages": self.session.snapshot()})
-        if path == "/api/compact":
-            return self._handle_compact()
-        if path == "/api/compact_summary":
-            return self._handle_compact_summary()
-        if path == "/api/strategy":
-            return self._handle_strategy()
-        if path == "/api/facts":
-            return self._handle_facts()
-        if path == "/api/memory":
-            return self._handle_memory()
-        if path == "/api/branches":
-            return self._handle_branches()
-        if path == "/api/task":
-            return self._handle_task()
-        if path == "/api/invariants":
-            return self._handle_invariants()
-        if path == "/api/profiles":
-            return self._handle_profiles()
-        if path == "/api/mcp":
-            return self._handle_mcp()
-        self._send_json(404, {"ok": False, "error": "Not Found"})
+    """Вспомогательные обработчики: compact, strategy, facts, memory и т.д."""
 
     def _handle_compact(self):
         """Обновляет настройки сжатия сессии (enabled/keep/summary)."""
@@ -53,15 +25,14 @@ class ApiHandler:
 
     def _handle_compact_summary(self):
         """Дописывает вытесненную часть истории в summary (по запросу)."""
-        from rtk_app import config as rtk_config
         data = self._read_json_body()
         if not data:
             return self._send_json(400, {"ok": False, "error": "Bad JSON."})
-        keep = data.get("keep", rtk_config.COMPACT_KEEP)
+        keep = data.get("keep", config.COMPACT_KEEP)
         try:
             keep = max(0, int(keep))
         except (TypeError, ValueError):
-            keep = rtk_config.COMPACT_KEEP
+            keep = config.COMPACT_KEEP
         self.session.set_compact(True, keep, None)
         head, end = self.session.head_to_compact()
         if not head:
@@ -128,7 +99,6 @@ class ApiHandler:
 
     def _handle_memory(self):
         """Память агента: чтение/запись трёх типов."""
-        from rtk_app import config as rtk_config
         data = self._read_json_body()
         if not data:
             return self._send_json(400, {"ok": False, "error": "Bad JSON."})
@@ -157,7 +127,7 @@ class ApiHandler:
                 })
             if action == "clear":
                 mt = str(mem_type or "").strip()
-                if mt not in rtk_config.MEMORY_TYPES:
+                if mt not in config.MEMORY_TYPES:
                     return self._send_json(400, {
                         "ok": False,
                         "error": "Неизвестный тип памяти: %r" % (mem_type,),

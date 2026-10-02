@@ -59,7 +59,8 @@ class AnswerAgent:
 
     def answer(self, question, history=None, selected=None, max_tokens=None,
                compact=None, memory=None, profile=None, answer_title=None,
-               task_state=None, invariants=None):
+               task_state=None, invariants=None, rag_enabled=False,
+               rag_query=None):
         """Обрабатывает запрос пользователя и возвращает результат."""
         from .. import config
         trace = []
@@ -94,7 +95,9 @@ class AnswerAgent:
 
         messages = self._build_messages(history, question, profile=profile,
                                         task_state=task_state,
-                                        invariants=invariants)
+                                        invariants=invariants,
+                                        rag_enabled=rag_enabled,
+                                        rag_query=rag_query)
         hlen = len(history) if isinstance(history, list) else 0
         prof_note = ""
         if isinstance(profile, dict) and (profile.get("character")
@@ -108,11 +111,14 @@ class AnswerAgent:
         inv_list = [i for i in (invariants or [])
                     if isinstance(i, dict) and str(i.get("text") or "").strip()]
         inv_note = (" | инвариантов: %d" % len(inv_list)) if inv_list else ""
+        rag_note = ""
+        if rag_enabled:
+            rag_note = " | RAG: включён"
         trace.append({"kind": "act", "title": "Агент собрал сообщения для API",
                       "detail": "%d сообщений (%d из истории + текущий) | системный "
-                                "промпт добавлен%s%s%s" % (len(messages), hlen,
-                                                          prof_note, task_note,
-                                                          inv_note)})
+                                "промпт добавлен%s%s%s%s" % (len(messages), hlen,
+                                                             prof_note, task_note,
+                                                             inv_note, rag_note)})
         print("[TRACE] Agent.answer() собрал %d сообщений для API" % len(messages),
               flush=True)
 
@@ -153,6 +159,8 @@ class AnswerAgent:
             node["dur_ms"] = int(single["elapsed"] * 1000)
             print("[TRACE]   <- результат %r: ok=%s" % (label, single["ok"]),
                   flush=True)
+            if single["ok"]:
+                ok_any = True
             input_total += single["prompt_tokens"]
             output_total += single["completion_tokens"]
 
